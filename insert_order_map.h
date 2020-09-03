@@ -1,26 +1,27 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
+#include <optional>
 #include <vector>
 
 namespace wl {
 
 // Vector-based associative container which keeps the insertion order.
-template<typename keyT, typename valueT>
+// Uses linear search, suitable for few elements.
+template<typename K, typename V>
 class insert_order_map final {
 public:
 	struct entry final {
-		keyT   key;
-		valueT value;
+		K key;
+		V val;
 
 		entry() = default;
-		explicit entry(const keyT& key) : key{key} { }
-		entry(const keyT& key, const valueT& value) : key{key}, value{value} { }
+		explicit entry(const K& key) : key{key} { }
+		entry(const K& key, const V& val) : key{key}, val{val} { }
 	};
 
 private:
@@ -28,164 +29,110 @@ private:
 
 public:
 	insert_order_map() = default;
-	insert_order_map(insert_order_map&& other) noexcept : _entries{std::move(other._entries)} { }
-	insert_order_map(std::initializer_list<entry> entries) : _entries{entries} { }
+	insert_order_map(insert_order_map&&) = default;
+	insert_order_map& operator=(insert_order_map&&) = default; // movable only
 
-	size_t            size() const noexcept      { return this->_entries.size(); }
-	bool              empty() const noexcept     { return this->_entries.empty(); }
-	insert_order_map& clear() noexcept           { this->_entries.clear(); return *this; }
-	insert_order_map& reserve(size_t numEntries) { this->_entries.reserve(numEntries); return *this; }
+	using iterator               = typename std::vector<entry>::iterator;
+	using const_iterator         = typename std::vector<entry>::const_iterator;
+	using reverse_iterator       = typename std::vector<entry>::reverse_iterator;
+	using const_reverse_iterator = typename std::vector<entry>::const_reverse_iterator;
 
-	insert_order_map& operator=(insert_order_map&& other) noexcept {
-		this->empty();
-		this->_entries.swap(other._entries);
-		return *this;
-	}
+	[[nodiscard]] iterator begin() noexcept { return this->_entries.begin(); }
+	[[nodiscard]] iterator end() noexcept   { return this->_entries.end(); }
+	[[nodiscard]] const_iterator begin() const noexcept  { return this->_entries.begin(); }
+	[[nodiscard]] const_iterator end() const noexcept    { return this->_entries.end(); }
+	[[nodiscard]] const_iterator cbegin() const noexcept { return this->_entries.cbegin(); }
+	[[nodiscard]] const_iterator cend() const noexcept   { return this->_entries.cend(); }
+	[[nodiscard]] reverse_iterator rbegin() noexcept { return this->_entries.rbegin(); }
+	[[nodiscard]] reverse_iterator rend() noexcept   { return this->_entries.rend(); }
+	[[nodiscard]] const_reverse_iterator rbegin() const noexcept  { return this->_entries.rbegin(); }
+	[[nodiscard]] const_reverse_iterator rend() const noexcept    { return this->_entries.rend(); }
+	[[nodiscard]] const_reverse_iterator crbegin() const noexcept { return this->_entries.crbegin(); }
+	[[nodiscard]] const_reverse_iterator crend() const noexcept   { return this->_entries.crend(); }
 
-	const valueT& operator[](const keyT& key) const {
-		typename std::vector<entry>::const_iterator ite = this->_find(key);
-		if (ite == this->_entries.cend()) {
-			throw std::out_of_range("Key doesn't exist.");
+	void                 clear() noexcept                       { this->_entries.clear(); }
+	[[nodiscard]] bool   contains(const K& key) const noexcept  { return this->_find_idx(key) != -1; }
+	[[nodiscard]] bool   empty() const noexcept                 { return this->_entries.empty(); }
+	void                 reserve(size_t newCapacity)            { this->_entries.reserve(newCapacity); }
+	[[nodiscard]] size_t size() const noexcept                  { return this->_entries.size(); }
+	void                 swap(insert_order_map& other) noexcept { this->_entries.swap(other._entries); }
+
+	// Returns a reference to the value with the given key.
+	// If key doesn't exist, inserts it by calling emplace().
+	V& operator[](const K& key)
+	{
+		size_t idx = this->_find_idx(key);
+		if (idx == -1) {
+			return this->emplace(key).first->val;
 		}
-		return ite->value;
+		return this->_entries[idx].val;
 	}
 
-	valueT& operator[](const keyT& key) noexcept {
-		typename std::vector<entry>::iterator ite = this->_find(key);
-		if (ite == this->_entries.end()) {
-			this->_entries.emplace_back(key); // inexistent, so add
-			return this->_entries.back().value;
+	// Inserts a new element into the container constructed in-place.
+	// Returns a pair consisting of an iterator to the inserted element, or the
+	// already-existing element if no insertion happened, and a bool denoting whether
+	// the insertion took place (true if insertion happened, false if it did not).
+	std::pair<iterator, bool> emplace(const K& key, const V& val)
+	{
+		size_t idx = this->_find_idx(key);
+		if (idx == -1) {
+			this->_entries.emplace_back(key, val);
+			return {--this->end(), true};
 		}
-		return ite->value;
+		return {this->begin() + idx, false};
 	}
 
-	// Returns pointer to value, if key doesn't exist returns nullptr.
-	const valueT* get_if_exists(const keyT& key) const noexcept {
-		// Saves time, instead of calling has() and operator[]().
-		typename std::vector<entry>::const_iterator ite = this->_find(key);
-		return (ite == this->_entries.cend()) ?
-			nullptr : &ite->value;
-	}
-
-	// Returns pointer to value, if key doesn't exist returns nullptr.
-	valueT* get_if_exists(const keyT& key) noexcept {
-		typename std::vector<entry>::iterator ite = this->_find(key);
-		return (ite == this->_entries.end()) ?
-			nullptr : &ite->value;
-	}
-
-	// Does the key exist?
-	bool has(const keyT& key) const noexcept {
-		return this->_find(key) != this->_entries.cend();
-	}
-
-	insert_order_map& remove(const keyT& key) {
-		typename std::vector<entry>::iterator ite = this->_find(key);
-		if (ite != this->_entries.end()) { // won't fail if inexistent
-			this->_entries.erase(ite);
+	// Inserts a new element into the container constructed in-place.
+	// Returns a pair consisting of an iterator to the inserted element, or the
+	// already-existing element if no insertion happened, and a bool denoting whether
+	// the insertion took place (true if insertion happened, false if it did not).
+	std::pair<iterator, bool> emplace(const K& key)
+	{
+		size_t idx = this->_find_idx(key);
+		if (idx == -1) {
+			this->_entries.emplace_back(key);
+			return {--this->end(), true};
 		}
-		return *this;
+		return {this->begin() + idx, false};
+	}
+
+	// Returns the element with the given key, if any.
+	[[nodiscard]] std::optional<std::reference_wrapper<const V>>
+		find(const K& key) const noexcept
+	{
+		return _find_val<const insert_order_map<K, V>, const V>(this, key);
+	}
+
+	// Returns the element with the given key, if any.
+	[[nodiscard]] std::optional<std::reference_wrapper<V>>
+		find(const K& key) noexcept
+	{
+		return _find_val<insert_order_map<K, V>, V>(this, key);
 	}
 
 private:
-	typename std::vector<entry>::const_iterator _find(const keyT& key) const noexcept {
-		for (typename std::vector<entry>::const_iterator ite = this->_entries.cbegin();
-			ite != this->_entries.cend(); ++ite)
-		{
-			if (ite->key == key) return ite;
+	[[nodiscard]] size_t _find_idx(const K& key) const noexcept
+	{
+		for (size_t i = 0; i < this->_entries.size(); ++i) {
+			if (this->_entries[i].key == key) { // if string, will be case-sensitive
+				return i;
+			}
 		}
-		return this->_entries.cend();
+		return -1;
 	}
 
-	typename std::vector<entry>::iterator _find(const keyT& key) noexcept {
-		for (typename std::vector<entry>::iterator ite = this->_entries.begin();
-			ite != this->_entries.end(); ++ite)
-		{
-			if (ite->key == key) return ite;
+	template<typename thisT, typename retT>
+	[[nodiscard]] static std::optional<std::reference_wrapper<retT>>
+		_find_val(thisT* thiss, const K& key) noexcept
+	{
+		// https://stackoverflow.com/a/11655924/6923555
+
+		size_t idx = thiss->_find_idx(key);
+		if (idx == -1) {
+			return {};
 		}
-		return this->_entries.end();
+		return {thiss->_entries[idx].val};
 	}
-
-private:
-	template<typename wrapped_itT>
-	class _base_iterator {
-	protected:
-		typename wrapped_itT _it;
-	public:
-		_base_iterator() = default;
-		_base_iterator(const _base_iterator& other) noexcept { this->operator=(other); }
-		_base_iterator(const wrapped_itT& it) noexcept : _it(it) { }
-		_base_iterator& operator=(const _base_iterator& other) noexcept { this->_it = other._it; return *this; }
-		_base_iterator  operator+(std::ptrdiff_t off) const { return {this->_it + off}; }
-		_base_iterator  operator-(std::ptrdiff_t off) const { return {this->_it - off}; }
-		_base_iterator& operator+=(std::ptrdiff_t off)      { this->_it += off; return *this; }
-		_base_iterator& operator-=(std::ptrdiff_t off)      { this->_it -= off; return *this; }
-		_base_iterator& operator++()    { ++this->_it; return *this; }
-		_base_iterator  operator++(int) { _base_iterator tmp = *this; ++this->_it; return tmp; }
-		_base_iterator& operator--()    { --this->_it; return *this; }
-		_base_iterator  operator--(int) { _base_iterator tmp = *this; --this->_it; return tmp; }
-		bool            operator==(const _base_iterator& other) const noexcept { return this->_it == other._it; }
-		bool            operator!=(const _base_iterator& other) const noexcept { return !this->operator==(other); }
-		bool            operator>(const _base_iterator& other) const noexcept  { return this->_it > other._it; }
-		bool            operator<(const _base_iterator& other) const noexcept  { return this->_it < other._it; }
-	};
-
-public:
-	class const_iterator final : public _base_iterator<typename std::vector<entry>::const_iterator> {
-	public:
-		const_iterator() = default;
-		const_iterator(const const_iterator& other) noexcept : _base_iterator(other) { }
-		const_iterator(const typename std::vector<entry>::const_iterator& it) noexcept : _base_iterator<typename std::vector<entry>::const_iterator>(it) { }
-		const_iterator& operator=(const const_iterator& other) noexcept { return this->_base_iterator(other); }
-		const entry&    operator*() const  { return this->_it.operator*(); }
-		const entry*    operator->() const { return this->_it.operator->(); }
-	};
-
-	class iterator final : public _base_iterator<typename std::vector<entry>::iterator> {
-	public:
-		iterator() = default;
-		iterator(const iterator& other) noexcept : _base_iterator(other) { }
-		iterator(const typename std::vector<entry>::iterator& it) noexcept : _base_iterator<typename std::vector<entry>::iterator>(it) { }
-		iterator& operator=(const iterator& other) noexcept { return this->_base_iterator(other); }
-		entry&    operator*()  { return this->_it.operator*(); }
-		entry*    operator->() { return this->_it.operator->(); }
-	};
-
-	const_iterator cbegin() const noexcept { return {this->_entries.cbegin()}; }
-	const_iterator begin() const noexcept  { return {this->_entries.cbegin()}; }
-	iterator       begin() noexcept        { return {this->_entries.begin()}; }
-	const_iterator cend() const noexcept   { return {this->_entries.cend()}; }
-	const_iterator end() const noexcept    { return {this->_entries.cend()}; }
-	iterator       end() noexcept          { return {this->_entries.end()}; }
-
-	class const_reverse_iterator final : public _base_iterator<typename std::vector<entry>::const_reverse_iterator> {
-	public:
-		const_reverse_iterator() = default;
-		const_reverse_iterator(const const_reverse_iterator& other) noexcept : _base_iterator(other) { }
-		const_reverse_iterator(const typename std::vector<entry>::const_reverse_iterator& it) noexcept : _base_iterator<typename std::vector<entry>::const_reverse_iterator>(it) { }
-		const_reverse_iterator& operator=(const const_reverse_iterator& other) noexcept { return this->_base_iterator(other); }
-		const entry&            operator*() const  { return this->_it.operator*(); }
-		const entry*            operator->() const { return this->_it.operator->(); }
-		const_iterator          base() const { return {this->_it.base()}; }
-	};
-
-	class reverse_iterator final : public _base_iterator<typename std::vector<entry>::reverse_iterator> {
-	public:
-		reverse_iterator() = default;
-		reverse_iterator(const reverse_iterator& other) noexcept : _base_iterator(other) { }
-		reverse_iterator(const typename std::vector<entry>::reverse_iterator& it) noexcept : _base_iterator<typename std::vector<entry>::reverse_iterator>(it) { }
-		reverse_iterator& operator=(const reverse_iterator& other) noexcept { return this->_base_iterator(other); }
-		entry&            operator*()  { return this->_it.operator*(); }
-		entry*            operator->() { return this->_it.operator->(); }
-		iterator          base() const { return {this->_it.base()}; }
-	};
-
-	const_reverse_iterator crbegin() const noexcept { return {this->_entries.crbegin()}; }
-	const_reverse_iterator rbegin() const noexcept  { return {this->_entries.crbegin()}; }
-	reverse_iterator       rbegin() noexcept        { return {this->_entries.rbegin()}; }
-	const_reverse_iterator crend() const noexcept   { return {this->_entries.crend()}; }
-	const_reverse_iterator rend() const noexcept    { return {this->_entries.crend()}; }
-	reverse_iterator       rend() noexcept          { return {this->_entries.rend()}; }
 };
 
 }//namespace wl

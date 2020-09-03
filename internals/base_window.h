@@ -1,151 +1,187 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
-#include "base_msg.h"
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <system_error>
+#include <Windows.h>
+#include "base_msg_handler.h"
+#include "interfaces.h"
 
-namespace wl {
 namespace _wli {
 
-// Common ground to all non-dialog windows.
+// Owns the HWND.
+// Calls RegisterClassEx() and CreateWindowEx().
+// Provides the window procedure.
 class base_window final {
-public:
-	// Reduced version of WNDCLASSEX to be used within setup_vars.
-	struct wndclassex_less final {
-		UINT           style = 0;
-		HICON          hIcon = nullptr;
-		HCURSOR        hCursor = nullptr;
-		HBRUSH         hbrBackground = nullptr;
-		const wchar_t* lpszMenuName = nullptr;
-		const wchar_t* lpszClassName = nullptr;
-		HICON          hIconSm = nullptr;
-	};
-
-	// Variables to be set by user, used only during window creation.
-	struct setup_vars {
-		wndclassex_less wndClassEx;
-		const wchar_t* title = nullptr;
-		DWORD          style = 0;
-		DWORD          exStyle = 0;
-		POINT          position{};
-		SIZE           size{};
-		HMENU          menu = nullptr;
-	};
-
 private:
-	HWND&              _hWnd;
-	base_msg<LRESULT>& _baseMsg;
+	HWND _hWnd = nullptr;
+	base_msg_handler _msgHandler;
 
 public:
-	~base_window() {
+	~base_window()
+	{
 		if (this->_hWnd) {
-			SetWindowLongPtrW(this->_hWnd, GWLP_USERDATA, 0);
+			SetWindowLongPtrW(this->_hWnd, GWLP_USERDATA, 0); // clear passed pointer
 		}
 	}
 
-	base_window(HWND& hWnd, base_msg<LRESULT>& baseMsg) noexcept :
-		_hWnd(hWnd), _baseMsg(baseMsg) { }
+	[[nodiscard]] const HWND hwnd() const noexcept { return this->_hWnd; }
 
-	void register_create(const setup_vars& setup, HWND hParent, HINSTANCE hInst = nullptr) {
-		this->_basic_initial_checks(setup);
-		if (!hParent && !hInst) {
-			throw std::invalid_argument("To create a window, HINSTANCE or parent HWND must be provided.");
-		}
-		if (!hInst) {
-			hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hParent, GWLP_HINSTANCE));
-		}
+	template<typename F>
+	void run_thread_ui(F&& func) { this->_msgHandler.run_thread_ui(this->_hWnd, std::move(func)); }
 
-		WNDCLASSEXW wcx = this->_gen_wndclassex(setup.wndClassEx, hInst);
-		ATOM atom = this->_register_class(wcx, setup);
+	// Calls RegisterClassEx().
+	ATOM register_class(WNDCLASSEXW& wcx) const
+	{
+		wcx.cbSize = sizeof(WNDCLASSEXW);
+		wcx.lpfnWndProc = _window_proc;
 
-		if (!CreateWindowExW(setup.exStyle,
-			reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(static_cast<WORD>(atom))), // from MAKEINTATOM macro
-			setup.title, setup.style,
-			setup.position.x, setup.position.y, setup.size.cx, setup.size.cy,
-			hParent, setup.menu, hInst, static_cast<LPVOID>(this)) )
-		{
-			throw std::system_error(GetLastError(), std::system_category(),
-				"CreateWindowEx failed");
-		}
-	}
-
-private:
-	void _basic_initial_checks(const setup_vars& setup) const {
-		if (this->_hWnd) {
-			throw std::logic_error("Tried to create window twice.");
-		}
-		if (!setup.wndClassEx.lpszClassName) {
-			throw std::logic_error("No window class name given on this->setup.wndClassEx.lpszClassName.");
-		}
-	}
-
-	ATOM _register_class(WNDCLASSEXW& wcx, const setup_vars& setup) {
+		SetLastError(ERROR_SUCCESS);
 		ATOM atom = RegisterClassExW(&wcx);
-		if (!atom) {
-			DWORD errCode = GetLastError();
-			if (errCode == ERROR_CLASS_ALREADY_EXISTS) {
-				atom = static_cast<ATOM>(GetClassInfoExW(wcx.hInstance,
-					wcx.lpszClassName, &wcx)); // https://blogs.msdn.microsoft.com/oldnewthing/20041011-00/?p=37603
-			} else {
-				throw std::system_error(errCode, std::system_category(),
-					"RegisterClassEx failed");
-			}
+		DWORD lerr = GetLastError();
+
+		if (lerr == ERROR_CLASS_ALREADY_EXISTS) {
+			// https://devblogs.microsoft.com/oldnewthing/20150429-00/?p=44984
+			// https://devblogs.microsoft.com/oldnewthing/20041011-00/?p=37603
+			atom = GetClassInfoExW(wcx.hInstance, wcx.lpszClassName, &wcx);
+		} else if (lerr != ERROR_SUCCESS) {
+			throw std::system_error(lerr, std::system_category(),
+				"RegisterClassEx failed.");
 		}
 		return atom;
 	}
 
-	WNDCLASSEXW _gen_wndclassex(const wndclassex_less& wLess, HINSTANCE hInst) const noexcept {
-		WNDCLASSEXW wcx{};
-		wcx.cbSize = sizeof(WNDCLASSEXW);
-		wcx.lpfnWndProc = _window_proc;
-		wcx.hInstance = hInst;
+	// Calls CreateWindowEx().
+	// Coordinates won't be adjusted to system DPI.
+	HWND create_window(HINSTANCE hInst, const wl::i_window* parent,
+		std::wstring_view className, std::optional<std::wstring_view> title,
+		HMENU hMenu, POINT pos, SIZE size, DWORD exStyles, DWORD styles)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot create a window twice.");
+		}
 
-		wcx.style = wLess.style;
-		wcx.hIcon = wLess.hIcon;
-		wcx.hCursor = wLess.hCursor;
-		wcx.hbrBackground = wLess.hbrBackground;
-		wcx.lpszMenuName = wLess.lpszMenuName;
-		wcx.lpszClassName = wLess.lpszClassName;
-		wcx.hIconSm = wLess.hIconSm;
-		return wcx;
+		HWND h = CreateWindowExW(exStyles, className.data(),
+			title.has_value() ? title.value().data() : nullptr,
+			styles, pos.x, pos.y, size.cx, size.cy,
+			parent ? parent->hwnd() : nullptr, hMenu, hInst,
+			reinterpret_cast<LPVOID>(this)); // pass pointer to self
+
+		if (!h) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"CreateWindowEx failed.");
+		}
+		return h; // our _hWnd member is set during WM_NCCREATE processing
 	}
 
-	static LRESULT CALLBACK _window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) noexcept {
+	template<typename F>
+	void on_message(UINT msg, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add a message handler after the window was created.");
+		}
+		this->_msgHandler.on_message(msg, std::move(func));
+	}
+
+	template<typename F>
+	void on_message(std::initializer_list<UINT> msgs, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add message handlers after the window was created.");
+		}
+		this->_msgHandler.on_message(msgs, std::move(func));
+	}
+
+	template<typename F>
+	void on_command(WORD cmd, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add a command handler after the window was created.");
+		}
+		this->_msgHandler.on_command(cmd, std::move(func));
+	}
+
+	template<typename F>
+	void on_command(std::initializer_list<WORD> cmds, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add command handlers after the window was created.");
+		}
+		this->_msgHandler.on_command(cmds, std::move(func));
+	}
+
+	template<typename F>
+	void on_notify(UINT_PTR idFrom, int code, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add a notify handler after the window was created.");
+		}
+		this->_msgHandler.on_notify(idFrom, code, std::move(func));
+	}
+
+	template<typename F>
+	void on_notify(std::initializer_list<std::pair<UINT_PTR, int>> idFromAndCodes, F&& func)
+	{
+		if (this->_hWnd) {
+			throw std::logic_error("Cannot add notify handlers after the window was created.");
+		}
+		this->_msgHandler.on_notify(idFromAndCodes, std::move(func));
+	}
+
+	// If cursor is not set, pick the default arrow.
+	static void wcx_set_cursor(HCURSOR setupCursor, WNDCLASSEXW& wcx)
+	{
+		wcx.hCursor = setupCursor
+			? setupCursor
+			: LoadCursorW(nullptr, IDC_ARROW);
+	}
+
+	// Generates a string hash that uniquely identifies a WNDCLASSEX object.
+	// This hash can be used as the class name.
+	// Must be called after all WNDCLASSEX fields are set, so they can be hashed.
+	[[nodiscard]] static std::wstring wcx_generate_hash(const WNDCLASSEXW& wcx)
+	{
+		return wl::str::format(L"WNDCLASS.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x",
+			wcx.style, wcx.lpfnWndProc, wcx.cbClsExtra, wcx.cbWndExtra,
+			wcx.hInstance, wcx.hIcon, wcx.hCursor, wcx.hbrBackground,
+			wcx.lpszMenuName, wcx.hIconSm);
+	}
+
+private:
+	static LRESULT CALLBACK _window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) noexcept
+	{
 		base_window* pSelf = nullptr;
 
 		if (msg == WM_NCCREATE) {
-			pSelf = reinterpret_cast<base_window*>(reinterpret_cast<CREATESTRUCT*>(lp)->lpCreateParams);
-			SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pSelf));
-			pSelf->_hWnd = hWnd; // store HWND
+			const CREATESTRUCTW* pCs = reinterpret_cast<const CREATESTRUCTW*>(lp);
+			pSelf = reinterpret_cast<base_window*>(pCs->lpCreateParams);
+			SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pSelf)); // store
+			pSelf->_hWnd = hWnd; // store HWND in class member
 		} else {
-			pSelf = reinterpret_cast<base_window*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+			pSelf = reinterpret_cast<base_window*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA)); // retrieve
 		}
 
-		auto cleanupIfDestroyed = [&]() noexcept -> void {
-			if (msg == WM_NCDESTROY) {
-				SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0);
-				if (pSelf) {
-					pSelf->_hWnd = nullptr; // clear HWND
-				}
-			}
-		};
-
-		if (pSelf) {
-			std::pair<bool, LRESULT> procRet = pSelf->_baseMsg.process_msg(msg, wp, lp); // catches all message exceptions internally
-			if (procRet.first) {
-				cleanupIfDestroyed();
-				return procRet.second; // message was processed
-			}
+		// If no pointer stored, then no processing is done.
+		// Prevents processing before WM_NCCREATE and after WM_NCDESTROY.
+		if (!pSelf) {
+			return DefWindowProcW(hWnd, msg, wp, lp);
 		}
 
-		cleanupIfDestroyed();
-		return DefWindowProcW(hWnd, msg, wp, lp); // message was not processed
+		// Execute user handler, if any.
+		std::optional<LRESULT> ret = pSelf->_msgHandler.exec(msg, wp, lp);
+
+		if (msg == WM_NCDESTROY) {
+			SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0); // clear passed pointer
+			pSelf->_hWnd = nullptr; // clear stored HWND
+		}
+		return ret.has_value() ? ret.value() : DefWindowProcW(hWnd, msg, wp, lp);
 	}
 };
 
 }//namespace _wli
-}//namespace wl

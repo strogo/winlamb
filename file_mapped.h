@@ -1,44 +1,52 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
+#include <string_view>
+#include <system_error>
+#include <Windows.h>
+#include "bin.h"
 #include "file.h"
 
 namespace wl {
 
-// Wrapper to a memory-mapped file.
+// Manages a memory-mapped file.
 class file_mapped final {
 private:
-	file   _file;
+	file _file;
 	HANDLE _hMap = nullptr;
-	void*  _pMem = nullptr;
+	void* _pMem = nullptr;
+	size_t _sz = 0;
+	bool _readOnly = true; // needed by set_new_size()
 
 public:
-	~file_mapped() {
-		this->close();
-	}
-
+	~file_mapped() { this->close(); }
 	file_mapped() = default;
 	file_mapped(file_mapped&& other) noexcept { this->operator=(std::move(other)); }
 
-	file_mapped& operator=(file_mapped&& other) noexcept {
+	file_mapped& operator=(file_mapped&& other) noexcept
+	{
 		this->close();
 		std::swap(this->_file, other._file);
 		std::swap(this->_hMap, other._hMap);
 		std::swap(this->_pMem, other._pMem);
+		std::swap(this->_sz, other._sz);
 		return *this;
 	}
 
-	file::access access_type() const noexcept { return this->_file.access_type(); }
-	size_t       size() noexcept              { return this->_file.size(); }
-	BYTE*        p_mem() const noexcept       { return reinterpret_cast<BYTE*>(this->_pMem); }
-	BYTE*        p_past_mem() noexcept        { return p_mem() + this->size(); }
+	[[nodiscard]] BYTE*  p_mem() const noexcept      { return reinterpret_cast<BYTE*>(this->_pMem); }
+	[[nodiscard]] BYTE*  p_past_mem() const noexcept { return p_mem() + this->_sz; }
+	[[nodiscard]] size_t size() const noexcept       { return this->_sz; }
 
-	file_mapped& close() noexcept {
+	file_mapped& open_read(std::wstring_view filePath)       { return this->_open(filePath, true); }
+	file_mapped& open_read_write(std::wstring_view filePath) { return this->_open(filePath, false); }
+
+	// Releases the file resource.
+	void close() noexcept
+	{
 		if (this->_pMem) {
 			UnmapViewOfFile(this->_pMem);
 			this->_pMem = nullptr;
@@ -48,83 +56,41 @@ public:
 			this->_hMap = nullptr;
 		}
 		this->_file.close();
-		return *this;
+		this->_sz = 0;
+		this->_readOnly = true; // not really needed
 	}
 
-	file_mapped& open(const std::wstring& filePath, file::access accessType) {
-		this->close();
-
-		// Open file.
-		this->_file.open_existing(filePath, accessType);
-
-		auto tooBad = [this](DWORD err, const char* msg) -> void {
-			this->close();
-			throw std::system_error(err, std::system_category(), msg);
-		};
-
-		// Mapping into memory.
-		this->_hMap = CreateFileMappingW(this->_file.hfile(), nullptr,
-			(accessType == file::access::READWRITE) ? PAGE_READWRITE : PAGE_READONLY, 0, 0, nullptr);
-		if (!this->_hMap) {
-			tooBad(GetLastError(), accessType == file::access::READWRITE ?
-				"CreateFileMapping failed to map file as read-write" :
-				"CreateFileMapping failed to map file as read-only");
-		}
-
-		// Get pointer to data block.
-		this->_pMem = MapViewOfFile(this->_hMap,
-			(accessType == file::access::READWRITE) ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, 0);
-		if (!this->_pMem) {
-			tooBad(GetLastError(), accessType == file::access::READWRITE ?
-				"CreateFileMapping failed to map file as read-write" :
-				"CreateFileMapping failed to map file as read-only");
-		}
-
-		return *this;
-	}
-
-private:
-	void _check_file_mapped() const {
-		if (!this->_hMap || !this->_pMem || !this->_file.hfile()) {
-			throw std::logic_error("File has not been mapped.");
-		}
-	}
-
-public:
-	// This method will truncate or expand the file, according to the new size.
-	file_mapped& set_new_size(size_t newSize) {
-		this->_check_file_mapped();
-
-		// Unmap file, but keep it open.
+	// Truncates or expands the file, which will be unmapped and remapped back into memory.
+	file_mapped& set_new_size(size_t numBytes)
+	{
 		UnmapViewOfFile(this->_pMem);
 		CloseHandle(this->_hMap);
 
-		// Truncate/expand file, probably fail if file was opened as read-only.
-		this->_file.set_new_size(newSize);
-
-		auto tooBad = [this](DWORD err, const char* msg) -> void {
-			this->close();
-			throw std::system_error(err, std::system_category(), msg);
-		};
-
-		// Remap into memory.
-		this->_hMap = CreateFileMappingW(this->_file.hfile(), 0, PAGE_READWRITE, 0, 0, nullptr);
-		if (!this->_hMap) {
-			tooBad(GetLastError(), "CreateFileMapping failed to recreate mapping");
-		}
-
-		// Get new pointer to data block, old one just became invalid.
-		this->_pMem = MapViewOfFile(this->_hMap, FILE_MAP_WRITE, 0, 0, 0);
-		if (!this->_pMem) {
-			tooBad(GetLastError(), "MapViewOfFile failed to recreate mapping");
-		}
-
-		return *this;
+		this->_file.set_new_size(numBytes);
+		return this->_map_into_memory(L"remapping after set new size");
 	}
 
-	// Reads file content, by default all at once.
-	file_mapped& read_to_buffer(std::vector<BYTE>& buf, size_t offset = 0, size_t numBytes = -1) {
-		this->_check_file_mapped();
+	// Copies file content.
+	// If numBytes is -1, reads until the end of file.
+	[[nodiscard]] std::vector<BYTE> read(size_t offset = 0, size_t numBytes = -1) const
+	{
+		std::vector<BYTE> buf;
+		this->read_to_buffer(buf, offset, numBytes);
+		return buf;
+	}
+
+	// Copies file content, and parses as wstring.
+	// If numBytes is -1, reads until the end of file.
+	[[nodiscard]] std::wstring read_as_string(size_t offset = 0, size_t numBytes = -1) const
+	{
+		return bin::parse_str(this->read(offset, numBytes));
+	}
+
+	// Copies file content into a buffer.
+	// If numBytes is -1, reads until the end of file.
+	const file_mapped& read_to_buffer(std::vector<BYTE>& buf,
+		size_t offset = 0, size_t numBytes = -1) const
+	{
 		if (offset >= this->size()) {
 			throw std::invalid_argument("Offset is beyond end of file.");
 		} else if (numBytes == -1 || offset + numBytes > this->size()) {
@@ -136,34 +102,46 @@ public:
 		return *this;
 	}
 
-	// Retrieves file content, by default all at once.
-	std::vector<BYTE> read(size_t offset = 0, size_t numBytes = -1) {
-		std::vector<BYTE> buf;
-		this->read_to_buffer(buf, offset, numBytes);
-		return buf;
+private:
+	file_mapped& _open(std::wstring_view filePath, bool readOnly)
+	{
+		this->close();
+		this->_readOnly = readOnly;
+
+		if (readOnly) {
+			this->_file.open_existing_read(filePath);
+		} else {
+			this->_file.open_existing_read_write(filePath);
+		}
+
+		return this->_map_into_memory(filePath);
 	}
 
-public:
-	class util final {
-	private:
-		util() = delete;
-
-	public:
-		static void read_to_buffer(const wchar_t* filePath, std::vector<BYTE>& buf) {
-			file_mapped fin;
-			fin.open(filePath, file::access::READONLY);
-			fin.read_to_buffer(buf);
+	file_mapped& _map_into_memory(std::wstring_view filePath)
+	{
+		// Mapping into memory.
+		this->_hMap = CreateFileMappingW(this->_file.hfile(), nullptr,
+			this->_readOnly ? PAGE_READONLY : PAGE_READWRITE, 0, 0, nullptr);
+		if (!this->_hMap) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"CreateFileMapping failed \"%s\".", filePath) ));
 		}
 
-		static std::vector<BYTE> read(const wchar_t* filePath) {
-			std::vector<BYTE> buf;
-			read_to_buffer(filePath, buf);
-			return buf;
+		// Get pointer to data block.
+		this->_pMem = MapViewOfFile(this->_hMap,
+			this->_readOnly ? FILE_MAP_READ : FILE_MAP_WRITE, 0, 0, 0);
+		if (!this->_pMem) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"MapViewOfFile failed \"%s\".", filePath) ));
 		}
 
-		static void              read_to_buffer(const std::wstring& filePath, std::vector<BYTE>& buf) { read_to_buffer(filePath.c_str(), buf); }
-		static std::vector<BYTE> read(const std::wstring& filePath)                                   { return read(filePath.c_str()); }
-	};
+		// Cache file size.
+		this->_sz = this->_file.size();
+
+		return *this;
+	}
 };
 
 }//namespace wl

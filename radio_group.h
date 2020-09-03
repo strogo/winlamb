@@ -1,133 +1,142 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
-#include <memory>
+#include <optional>
+#include <stdexcept>
 #include <vector>
-#include "radio.h"
+#include <Windows.h>
+#include "internals/radio_button.h"
 
 namespace wl {
 
-// Automates a group of native radio buttons.
+// Manages a group of native radio button controls.
+// https://docs.microsoft.com/en-us/windows/win32/controls/button-types-and-styles#radio-buttons
 class radio_group final {
 private:
-	size_t                   _sz = 0;
-	std::unique_ptr<radio[]> _items; // vector requires movable object, so we use an ordinary array
+	std::vector<radio_button> _items;
 
 public:
 	radio_group() = default;
 	radio_group(radio_group&&) = default;
 	radio_group& operator=(radio_group&&) = default; // movable only
 
-	radio_group& assign(HWND hParent, std::initializer_list<int> ctrlIds) {
-		if (this->_items) {
-			throw std::logic_error("Trying to assign a radio group twice.");
+	// Tells if the radio group is empty.
+	[[nodiscard]] bool empty() const noexcept { return this->_items.empty(); }
+
+	// Returns the number of radio controls in this radio group.
+	[[nodiscard]] size_t size() const noexcept { return this->_items.size(); }
+
+	[[nodiscard]] const radio_button& operator[](size_t index) const noexcept { return this->_items[index]; }
+	[[nodiscard]] radio_button&       operator[](size_t index) noexcept       { return this->_items[index]; }
+
+	// In a dialog window, assign to controls.
+	radio_group& assign(i_window* parent, std::initializer_list<int> radioIds)
+	{
+		if (!this->empty()) {
+			throw std::logic_error("Cannot assign a radio group twice.");
 		}
 
-		this->_sz = ctrlIds.size();
-		this->_items = std::make_unique<radio[]>(ctrlIds.size());
-		size_t i = 0;
-		for (int ctrlId : ctrlIds) {
-			this->_items[i++].assign(hParent, ctrlId);
-		}
-		this->_items[0].set_check(true) // first is checked by default
-			.style.first_in_group(true); // and receives WS_GROUP
-		return *this;
-	}
-
-	radio_group& assign(const wnd* parent, std::initializer_list<int> ctrlIds) {
-		return this->assign(parent->hwnd(), ctrlIds);
-	}
-
-	size_t size() const noexcept {
-		return this->_sz;
-	}
-
-	std::vector<int> get_all_ids() const {
-		std::vector<int> ids;
-		ids.reserve(this->_sz);
-		for (size_t i = 0; i < this->_sz; ++i) {
-			ids.emplace_back(this->_items[i].ctrl_id());
-		}
-		return ids;
-	}
-
-	const radio& get_by_pos(size_t index) const {
-		return this->_items[index];
-	}
-
-	radio& get_by_pos(size_t index) {
-		return this->_items[index];
-	}
-
-	const radio& get_by_id(int ctrlId) const {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (this->_items[i].ctrl_id() == ctrlId) {
-				return this->_items[i];
-			}
-		}
-		throw std::out_of_range("Radio ID doesn't exist.");
-	}
-
-	radio& get_by_id(int ctrlId) {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (this->_items[i].ctrl_id() == ctrlId) {
-				return this->_items[i];
-			}
-		}
-		throw std::out_of_range("Radio ID doesn't exist.");
-	}
-
-	radio_group& set_enabled(bool enabled) noexcept {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			this->_items[i].set_enabled(enabled);
+		this->_items.reserve(radioIds.size());
+		for (int radioId : radioIds) {
+			radio_button newRadio{};
+			newRadio.assign(parent, radioId);
+			this->_items.emplace_back(std::move(newRadio));
 		}
 		return *this;
 	}
 
-	radio_group& set_checked_by_pos(size_t index) {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (i != index) {
-				this->_items[i].set_check(false);
-			}
-		}
-		this->_items[index].set_check_and_trigger(true);
+	// Calls CreateWindowEx() to add a new radio button control.
+	// Should be called during parent's WM_CREATE processing.
+	// Position will be adjusted to match current system DPI.
+	radio_group& add_create(const i_window* parent, int id,
+		std::wstring_view text, POINT pos)
+	{
+		radio_button::type t = this->empty()
+			? radio_button::type::FIRST
+			: radio_button::type::NONFIRST;
+
+		radio_button newRadio{};
+		newRadio.create(parent, id, t, text, pos);
+		this->_items.emplace_back(std::move(newRadio));
 		return *this;
 	}
 
-	radio_group& set_checked_by_id(int ctrlId) {
-		size_t target = -1;
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (this->_items[i].ctrl_id() == ctrlId) {
-				target = i;
-			} else {
-				this->_items[i].set_check(false);
-			}
+	// Returns the radio button with the given control ID, if any.
+	[[nodiscard]] std::optional<std::reference_wrapper<const radio_button>>
+		by_id(int radioId) const noexcept
+	{
+		return _by_id<const radio_group, const radio_button>(this, radioId);
+	}
+
+	// Returns the radio button with the given control ID, if any.
+	[[nodiscard]] std::optional<std::reference_wrapper<radio_button>>
+		by_id(int radioId) noexcept
+	{
+		return _by_id<radio_group, radio_button>(this, radioId);
+	}
+
+	// Returns the currently checked radio button, if any.
+	[[nodiscard]] std::optional<std::reference_wrapper<const radio_button>>
+		checked() const noexcept
+	{
+		return _checked<const radio_group, const radio_button>(this);
+	}
+
+	// Returns a reference to the currently checked radio button.
+	[[nodiscard]] std::optional<std::reference_wrapper<radio_button>>
+		checked() noexcept
+	{
+		return _checked<radio_group, radio_button>(this);
+	}
+
+	// Returns the ID of the currently checked radio button.
+	[[nodiscard]] std::optional<int> checked_id() const noexcept
+	{
+		auto checkedRadio = this->checked();
+		if (checkedRadio.has_value()) {
+			return checkedRadio.value().get().id();
 		}
-		this->_items[target].set_check_and_trigger(true);
+		return {};
+	}
+
+	// Enables or disables all radio buttons at once.
+	const radio_group& enable(bool isEnabled) const noexcept
+	{
+		for (const radio_button& rb : this->_items) {
+			rb.enable(isEnabled);
+		}
 		return *this;
 	}
 
-	size_t get_checked_pos() const {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (this->_items[i].is_checked()) {
-				return i;
+private:
+	template<typename thisT, typename retT>
+	[[nodiscard]] static std::optional<std::reference_wrapper<retT>>
+		_by_id(thisT* thiss, int radioId) noexcept
+	{
+		// https://stackoverflow.com/a/11655924/6923555
+
+		for (retT& rad : thiss->_items) {
+			if (rad.id() == radioId) {
+				return {rad};
 			}
 		}
-		throw std::logic_error("Radio group has no assigned value.");
+		return {};
 	}
 
-	int get_checked_id() const {
-		for (size_t i = 0; i < this->_sz; ++i) {
-			if (this->_items[i].is_checked()) {
-				return this->_items[i].ctrl_id();
+	template<typename thisT, typename retT>
+	[[nodiscard]] static std::optional<std::reference_wrapper<retT>>
+		_checked(thisT* thiss) noexcept
+	{
+		for (retT& rad : thiss->_items) {
+			if (rad.checked()) {
+				return {rad};
 			}
 		}
-		throw std::logic_error("Radio group has no assigned value.");
+		return {};
 	}
 };
 

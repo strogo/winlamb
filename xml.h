@@ -1,178 +1,107 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
-#include <string>
+#include <optional>
+#include <string_view>
+#include <system_error>
+#include <Windows.h>
+#include <MsXml6.h>
+#include "internals/xml_node.h"
 #include "com.h"
 #include "insert_order_map.h"
-#include <MsXml2.h>
-#pragma comment(lib, "msxml2.lib")
+#pragma comment(lib, "msxml6.lib")
 
 namespace wl {
 
-// XML wrapper class to MSXML2 Windows library.
+// Handles XML documents using MSXML 6.0 library.
 class xml final {
-public:
-	// A single XML node.
-	class node final {
-	public:
-		std::wstring name;
-		std::wstring value;
-		insert_order_map<std::wstring, std::wstring> attrs;
-		std::vector<node> children;
-
-		void clear() noexcept {
-			this->name.clear();
-			this->value.clear();
-			this->attrs.clear();
-			this->children.clear();
-		}
-
-		std::vector<std::reference_wrapper<node>> children_by_name(const wchar_t* elemName) {
-			std::vector<std::reference_wrapper<node>> nodeBuf;
-			for (node& node : this->children) {
-				if (!lstrcmpiW(node.name.c_str(), elemName)) { // case-insensitive match
-					nodeBuf.emplace_back(node);
-				}
-			}
-			return nodeBuf;
-		}
-
-		std::vector<std::reference_wrapper<node>> children_by_name(const std::wstring& elemName) {
-			return this->children_by_name(elemName.c_str());
-		}
-
-		node* first_child_by_name(const wchar_t* elemName) noexcept {
-			for (node& node : this->children) {
-				if (!lstrcmpiW(node.name.c_str(), elemName)) { // case-insensitive match
-					return &node;
-				}
-			}
-			return nullptr; // not found
-		}
-
-		node* first_child_by_name(const std::wstring& elemName) noexcept {
-			return this->first_child_by_name(elemName.c_str());
-		}
-	};
-
 private:
 	com::lib _comLib{com::lib::init::LATER};
 
 public:
 	// Root node of this XML document.
-	node root;
+	xml_node root;
 
 	xml() = default;
-	xml(xml&& other) noexcept    : root{std::move(other.root)} { }
-	xml(const wchar_t* str)      { this->parse(str); }
-	xml(const std::wstring& str) : xml(str.c_str()) { }
+	xml(std::wstring_view xmlString) { this->parse(xmlString); }
+	xml(xml&& other) noexcept { operator=(std::move(other)); } // movable only
+	xml& operator=(xml&& other) = default;
 
-	xml& operator=(xml&& other) noexcept {
-		this->root.clear();
-		this->root = std::move(other.root);
-		return *this;
-	}
-
-	xml& parse(const wchar_t* str) {
-		this->_comLib.initialize(); // init COM library, if not yet
-		this->root.clear();
+	// Parses an XML string and loads it in memory.
+	xml& parse(std::wstring_view xmlString)
+	{
+		this->_comLib.initialize();
+		this->root = {};
 
 		// Create COM object for XML document.
-		com::ptr<IXMLDOMDocument2> doc;
-		doc.co_create_instance(CLSID_DOMDocument30, IID_IXMLDOMDocument);
-		doc->put_async(FALSE);
+		auto doc = com::co_create_instance<IXMLDOMDocument3>(
+			CLSID_DOMDocument60, CLSCTX_INPROC_SERVER);
+		doc->put_async(false);
 
 		// Parse the XML string.
 		VARIANT_BOOL vb = FALSE;
-		com::check_hr(
-			doc->loadXML(static_cast<BSTR>(const_cast<wchar_t*>(str)), &vb),
-			"IXMLDOMDocument::loadXML failed");
+		HRESULT hr = doc->loadXML(
+			static_cast<BSTR>(const_cast<wchar_t*>(xmlString.data())), &vb);
+		if (FAILED(hr)) {
+			throw std::system_error(hr, std::system_category(),
+				"IXMLDOMDocument3::loadXML failed.");
+		}
 
-		// Get document element and root node from XML.
+		// Get document element and root node.
 		com::ptr<IXMLDOMElement> docElem;
-		com::check_hr(
-			doc->get_documentElement(&docElem),
-			"IXMLDOMDocument::get_documentElement failed");
+		hr = doc->get_documentElement(docElem.raw_pptr());
+		if (FAILED(hr)) {
+			throw std::system_error(hr, std::system_category(),
+				"IXMLDOMDocument3::get_documentElement failed.");
+		}
 
-		com::ptr<IXMLDOMNode> rootNode;
-		docElem.query_interface(IID_IXMLDOMNode, &rootNode);
-		this->root = _build_node(rootNode); // recursive, the whole tree is loaded into memory
+		auto rootNode = docElem.query_interface<IXMLDOMNode>();
+		this->root = _build_node(rootNode);
 		return *this;
 	}
 
-	xml& parse(const std::wstring& str) {
-		return this->parse(str.c_str());
-	}
-
 private:
-	static xml::node _build_node(com::ptr<IXMLDOMNode>& xmlDomNode) {
-		xml::node ret;
+	static xml_node _build_node(com::ptr<IXMLDOMNode>& xmlDomNode)
+	{
+		xml_node myNode;
 
 		// Get node name.
 		com::bstr bstrName;
-		xmlDomNode->get_nodeName(&bstrName);
-		ret.name = bstrName.c_str();
+		HRESULT hr = xmlDomNode->get_nodeName(&bstrName);
+		if (FAILED(hr)) {
+			throw std::system_error(hr, std::system_category(),
+				"IXMLDOMNode::get_nodeName failed.");
+		}
+		myNode.name = bstrName.c_str();
 
-		// Parse attributes of node, if any.
-		ret.attrs = _read_attrs(xmlDomNode);
+		// Parse attributes, if any.
+		myNode.attrs = _parse_attributes(xmlDomNode);
 
 		// Process children, if any.
-		VARIANT_BOOL vb = FALSE;
-		xmlDomNode->hasChildNodes(&vb);
-		if (vb) {
-			com::ptr<IXMLDOMNodeList> nodeList;
-			xmlDomNode->get_childNodes(&nodeList);
-			ret.children.reserve(_count_child_nodes(nodeList));
+		_parse_children(xmlDomNode, myNode);
 
-			int childCount = 0;
-			long totalCount = 0;
-			nodeList->get_length(&totalCount);
-
-			for (long i = 0; i < totalCount; ++i) {
-				com::ptr<IXMLDOMNode> child;
-				nodeList->get_item(i, &child);
-
-				// Node can be text or an actual child node.
-				DOMNodeType type = NODE_INVALID;
-				child->get_nodeType(&type);
-				if (type == NODE_TEXT) {
-					com::bstr bstrText;
-					xmlDomNode->get_text(&bstrText);
-					ret.value.append(bstrText.c_str());
-				} else if (type == NODE_ELEMENT) {
-					ret.children.emplace_back(_build_node(child)); // recursively
-				} else {
-					// (L"Unhandled node type: %d.\n", type);
-				}
-			}
-		} else {
-			// Assumes that only a leaf node can have text.
-			com::bstr bstrText;
-			xmlDomNode->get_text(&bstrText);
-			ret.value = bstrText.c_str();
-		}
-		return ret;
+		return myNode;
 	}
 
-	static insert_order_map<std::wstring, std::wstring> _read_attrs(com::ptr<IXMLDOMNode>& xmlnode) {
-		// Read attribute collection.
+	[[nodiscard]] static insert_order_map<std::wstring, std::wstring>
+		_parse_attributes(com::ptr<IXMLDOMNode>& xmlDomNode)
+	{
 		com::ptr<IXMLDOMNamedNodeMap> attrs;
-		xmlnode->get_attributes(&attrs);
+		xmlDomNode->get_attributes(attrs.raw_pptr());
 
 		long attrCount = 0;
 		attrs->get_length(&attrCount);
 
-		insert_order_map<std::wstring, std::wstring> ret;
-		ret.reserve(attrCount);
+		insert_order_map<std::wstring, std::wstring> myAttrs;
+		myAttrs.reserve(attrCount);
 
 		for (long i = 0; i < attrCount; ++i) {
 			com::ptr<IXMLDOMNode> attr;
-			attrs->get_item(i, &attr);
+			attrs->get_item(i, attr.raw_pptr());
 
 			DOMNodeType type = NODE_INVALID;
 			attr->get_nodeType(&type);
@@ -181,26 +110,61 @@ private:
 				attr->get_nodeName(&bstrName); // get attribute name
 				com::variant variNodeVal;
 				attr->get_nodeValue(&variNodeVal); // get attribute value
-				ret[bstrName.c_str()] = variNodeVal.get_str(); // add hash entry
+				myAttrs[bstrName.c_str()] = variNodeVal.str(); // add hash entry
 			}
 		}
-		return ret;
+		return myAttrs;
 	}
 
-	static int _count_child_nodes(com::ptr<IXMLDOMNodeList>& nodeList) noexcept {
-		int childCount = 0;
-		long totalCount = 0;
-		nodeList->get_length(&totalCount); // includes text and actual element nodes
+	static void _parse_children(com::ptr<IXMLDOMNode>& xmlDomNode, xml_node& myNode)
+	{
+		VARIANT_BOOL vb = FALSE;
+		xmlDomNode->hasChildNodes(&vb);
 
-		for (long i = 0; i < totalCount; ++i) {
-			com::ptr<IXMLDOMNode> child;
-			nodeList->get_item(i, &child);
+		if (vb) {
+			com::ptr<IXMLDOMNodeList> nodeList;
+			HRESULT hr = xmlDomNode->get_childNodes(nodeList.raw_pptr());
+			if (FAILED(hr)) {
+				throw std::system_error(hr, std::system_category(),
+					"IXMLDOMNode::get_childNodes failed.");
+			}
 
-			DOMNodeType type = NODE_INVALID;
-			child->get_nodeType(&type);
-			if (type == NODE_ELEMENT) ++childCount;
+			int childCount = 0;
+			long totalCount = 0;
+			nodeList->get_length(&totalCount);
+
+			for (long i = 0; i < totalCount; ++i) {
+				com::ptr<IXMLDOMNode> child;
+				hr = nodeList->get_item(i, child.raw_pptr());
+				if (FAILED(hr)) {
+					throw std::system_error(hr, std::system_category(),
+						"IXMLDOMNodeList::get_item failed.");
+				}
+
+				// Node can be text or an actual child node.
+				DOMNodeType type = NODE_INVALID;
+				hr = child->get_nodeType(&type);
+				if (FAILED(hr)) {
+					throw std::system_error(hr, std::system_category(),
+						"IXMLDOMNode::get_nodeType failed.");
+				}
+
+				if (type == NODE_TEXT) {
+					com::bstr bstrText;
+					xmlDomNode->get_text(&bstrText);
+					myNode.text.append(bstrText.c_str()); // if text, append to current node text
+				} else if (type == NODE_ELEMENT) {
+					myNode.children.emplace_back(_build_node(child)); // recursively
+				} else {
+					// (L"Unhandled node type: %d.\n", type);
+				}
+			}
+		} else {
+			// Assumes that only a leaf node can have text.
+			com::bstr bstrText;
+			xmlDomNode->get_text(&bstrText); // if text, append to current node text
+			myNode.text = bstrText.c_str();
 		}
-		return childCount;
 	}
 };
 

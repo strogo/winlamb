@@ -1,257 +1,397 @@
 /**
  * Part of WinLamb - Win32 API Lambda Library
  * https://github.com/rodrigocfd/winlamb
- * Copyright 2017-present Rodrigo Cesar de Freitas Dias
  * This library is released under the MIT License
  */
 
 #pragma once
-#include <string>
+#include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <Windows.h>
+#include "str.h"
 
 namespace wl {
 
-// Wrapper to HMENU handle.
-class menu final {
+// Simply holds a menu handle (HMENU).
+// https://docs.microsoft.com/en-us/windows/win32/menurc/about-menus
+class menu {
 protected:
 	HMENU _hMenu = nullptr;
 
 public:
+	virtual ~menu() { }
 	menu() = default;
-	menu(HMENU hMenu) noexcept   : _hMenu(hMenu) { }
-	menu(const menu& m) noexcept : _hMenu(m._hMenu) { }
+	explicit menu(HMENU hMenu) noexcept : _hMenu{hMenu} { }
+	menu(const menu&) = default;
+	menu& operator=(const menu&) = default;
 
-	HMENU hmenu() const noexcept {
-		return this->_hMenu;
-	}
+	bool operator==(const menu& other) const noexcept { return this->_hMenu == other._hMenu; }
+	bool operator!=(const menu& other) const noexcept { return !this->operator==(other); }
 
-	menu& operator=(HMENU hMenu) noexcept {
-		this->_hMenu = hMenu;
+	// Returns the HMENU.
+	[[nodiscard]] HMENU hmenu() const noexcept { return this->_hMenu; }
+
+	// Calls AppendMenu().
+	const menu& append_item(int cmdId, std::wstring_view text) const
+	{
+		if (!AppendMenuW(this->_hMenu, MF_STRING, cmdId, text.data())) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"AppendMenu failed.");
+		}
 		return *this;
 	}
 
-	menu& operator=(const menu& m) noexcept {
-		this->_hMenu = m._hMenu;
+	// Calls AppendMenu().
+	const menu& append_separator() const
+	{
+		if (!AppendMenuW(this->_hMenu, MF_SEPARATOR, 0, nullptr)) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"AppendMenu failed.");
+		}
 		return *this;
 	}
 
-	void destroy() noexcept {
-		// Since HMENU resource can be shared, destroy() won't be called on destructor.
+	// Calls CreateMenuPopup() and AppendMenu().
+	// Returns the newly appended menu.
+	menu append_submenu(std::wstring_view text) const
+	{
+		HMENU pop = _create_submenu();
+
+		if (!AppendMenuW(this->_hMenu, MF_STRING | MF_POPUP,
+			reinterpret_cast<UINT_PTR>(pop), text.data()))
+		{
+			throw std::system_error(GetLastError(), std::system_category(),
+				"AppendMenu failed.");
+		}
+
+		return menu{pop};
+	}
+
+	// Retrieves the command ID of the menu item at the given position.
+	// Throws exception if the item is out of range or a submenu.
+	[[nodiscard]] int cmd_by_pos(size_t pos) const
+	{
+		int cmdId = GetMenuItemID(this->_hMenu, static_cast<int>(pos));
+		if (cmdId == -1) {
+			throw std::invalid_argument(
+				str::unicode_to_ansi(
+					str::format(L"Failed retrieve command ID of position %d.", pos) ));
+		}
+		return cmdId;
+	}
+
+	// Calls GetMenuItemCount() and then DeleteMenu() on each item.
+	const menu& delete_all_items() const
+	{
+		for (size_t i = this->item_count(); i-- > 0; ) {
+			this->delete_by_pos(i);
+		}
+		return *this;
+	}
+
+	// Calls DeleteMenu().
+	const menu& delete_by_cmd(int cmdId) const { return this->_delete(cmdId, false); }
+	// Calls DeleteMenu().
+	const menu& delete_by_pos(size_t pos) const { return this->_delete(static_cast<UINT>(pos), true); }
+
+	// Calls EnableMenuItem().
+	const menu& enable_by_cmd(int cmdId, bool isEnabled) const { return this->_enable(cmdId, isEnabled, false); }
+	// Calls EnableMenuItem().
+	const menu& enable_by_pos(size_t pos, bool isEnabled) const { return this->_enable(static_cast<UINT>(pos), isEnabled, true); }
+
+	// Calls EnableMenuItem().
+	const menu& enable_by_cmd(std::initializer_list<int> cmdIds, bool isEnabled) const
+	{
+		for (int cmdId : cmdIds) {
+			this->enable_by_cmd(cmdId, isEnabled);
+		}
+		return *this;
+	}
+
+	// Calls EnableMenuItem().
+	const menu& enable_by_pos(std::initializer_list<size_t> poss, bool isEnabled) const
+	{
+		for (size_t pos : poss) {
+			this->enable_by_pos(pos, isEnabled);
+		}
+		return *this;
+	}
+
+	// Calls InsertMenuItem().
+	const menu& insert_item_before_cmd(
+		int cmdIdBefore, int newCmdId, std::wstring_view text) const
+	{
+		return this->_insert_item_before(cmdIdBefore, newCmdId, text, false);
+	}
+
+	// Calls InsertMenuItem().
+	const menu& insert_item_before_pos(
+		size_t posBefore, int newCmdId, std::wstring_view text) const
+	{
+		return this->_insert_item_before(
+			static_cast<UINT>(posBefore), newCmdId, text, true);
+	}
+
+	// Calls CreateMenuPopup() and InsertMenu().
+	// Returns the newly inserted menu.
+	menu insert_submenu_before_cmd(int cmdIdBefore, std::wstring_view text) const
+	{
+		return this->_insert_submenu_before(cmdIdBefore, text, false);
+	}
+
+	// Calls CreateMenuPopup() and InsertMenu().
+	// Returns the newly inserted menu.
+	menu insert_submenu_before_pos(size_t posBefore, std::wstring_view text) const
+	{
+		return this->_insert_submenu_before(
+			static_cast<UINT>(posBefore), text, true);
+	}
+
+	// Calls GetMenuItemCount().
+	size_t item_count() const
+	{
+		int count = GetMenuItemCount(this->_hMenu);
+		if (count == -1) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"GetMenuItemCount failed.");
+		}
+		return count;
+	}
+
+	// Calls SetMenuItemInfo().
+	const menu& set_text_by_cmd(int cmdId, std::wstring_view text) const { return this->_set_text(cmdId, text, false); }
+	// Calls SetMenuItemInfo().
+	const menu& set_text_by_pos(size_t pos, std::wstring_view text) const { return this->_set_text(static_cast<UINT>(pos), text, true); }
+
+	// Shows the floating menu anchored at the given coordinates with TrackPopupMenu().
+	// If hCoordsRelativeTo is null, coordinates must be relative to hParent.
+	// This function will block until the menu disappears.
+	const menu& show_at_point(
+		HWND hParent, POINT pt, HWND hWndCoordsRelativeTo) const
+	{
+		POINT ptParent = pt; // receives coordinates relative to hParent
+		if (!ClientToScreen(hWndCoordsRelativeTo ?
+			hWndCoordsRelativeTo : hParent, &ptParent)) // to screen coordinates
+		{
+			throw std::runtime_error("ClientToScreen failed.");
+		}
+
+		SetForegroundWindow(hParent);
+
+		if (!TrackPopupMenu(this->_hMenu, TPM_LEFTBUTTON,
+			ptParent.x, ptParent.y, 0, hParent, nullptr)) // owned by hParent, so messages go to it
+		{
+			throw std::system_error(GetLastError(), std::system_category(),
+				"TrackPopupMenu failed.");
+		}
+
+		PostMessageW(hParent, WM_NULL, 0, 0); // http://msdn.microsoft.com/en-us/library/ms648002%28VS.85%29.aspx
+		return *this;
+	}
+
+	// Retrieves the sub menu at the given position.
+	[[nodiscard]] menu sub_menu(size_t pos) const
+	{
+		HMENU hSub = GetSubMenu(this->_hMenu, static_cast<int>(pos));
+		if (!hSub) {
+			throw std::invalid_argument(
+				str::unicode_to_ansi(
+					str::format(L"Position %d is not a sub menu.", pos) ));
+		}
+		return menu{hSub};
+	}
+
+	// Retrieves the text with GetMenuItemInfo().
+	[[nodiscard]] std::wstring text_by_cmd(int cmdId) const { return this->_text(cmdId, false); }
+	// Retrieves the text with GetMenuItemInfo().
+	[[nodiscard]] std::wstring text_by_pos(size_t pos) const { return this->_text(static_cast<UINT>(pos), true); }
+
+private:
+	const menu& _delete(UINT cmdOrPos, bool byPos) const
+	{
+		if (!DeleteMenu(this->_hMenu, cmdOrPos, byPos ? MF_BYPOSITION : MF_BYCOMMAND)) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"DeleteMenu %d failed.", cmdOrPos) ));
+		}
+		return *this;
+	}
+
+	const menu& _enable(UINT cmdOrPos, bool isEnabled, bool byPos) const
+	{
+		UINT flags = (isEnabled ? MF_ENABLED : MF_GRAYED)
+			| (byPos ? MF_BYPOSITION : MF_BYCOMMAND);
+
+		if (EnableMenuItem(this->_hMenu, cmdOrPos, flags) == -1) {
+			throw std::logic_error(
+				str::unicode_to_ansi(
+					str::format(L"The menu item %d doesn't exist.", cmdOrPos) ));
+		}
+		return *this;
+	}
+
+	const menu& _insert_item_before(
+		UINT cmdOrPosBefore, int newCmdId, std::wstring_view text, bool byPos) const
+	{
+		UINT flag = byPos ? MF_BYPOSITION : MF_BYCOMMAND;
+
+		if (!InsertMenuW(this->_hMenu, cmdOrPosBefore,
+			flag | MF_STRING, newCmdId, text.data() ))
+		{
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"InsertMenu failed for \"%s\".", text) ));
+		}
+		return *this;
+	}
+
+	menu _insert_submenu_before(
+		UINT cmdOrPosBefore, std::wstring_view text, bool byPos) const
+	{
+		UINT flag = byPos ? MF_BYPOSITION : MF_BYCOMMAND;
+		HMENU pop = _create_submenu();
+
+		if (!InsertMenuW(this->_hMenu, cmdOrPosBefore, flag | MF_POPUP,
+			reinterpret_cast<UINT_PTR>(pop), text.data() ))
+		{
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"InsertMenu failed for \"%s\".", text) ));
+		}
+
+		return menu{pop};
+	}
+
+	const menu& _set_text(UINT cmdOrPos, std::wstring_view text, bool byPos) const
+	{
+		MENUITEMINFOW mii{};
+		mii.cbSize = sizeof(MENUITEMINFOW);
+		mii.fMask = MIIM_STRING;
+		mii.dwTypeData = const_cast<wchar_t*>(text.data());
+
+		if (!SetMenuItemInfoW(this->_hMenu, cmdOrPos, byPos, &mii)) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"InsertMenu failed for \"%s\".", text) ));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] const std::wstring _text(UINT cmdOrPos, bool byPos) const
+	{
+		MENUITEMINFOW mii{};
+		mii.cbSize = sizeof(MENUITEMINFOW);
+		mii.fMask = MIIM_STRING;
+
+		if (!GetMenuItemInfoW(this->_hMenu, cmdOrPos, byPos, &mii)) { // retrieve length
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"GetMenuItemInfo failed to retrieve text length from %d.", cmdOrPos) ));
+		}
+		++mii.cch; // add room for terminating null
+
+		std::wstring buf(mii.cch, L'\0');
+		mii.dwTypeData = &buf[0];
+		if (!GetMenuItemInfoW(this->_hMenu, cmdOrPos, byPos, &mii)) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				str::unicode_to_ansi(
+					str::format(L"GetMenuItemInfo failed to retrieve text from %d.", cmdOrPos) ));
+		}
+		return buf;
+	}
+
+	[[nodiscard]] static HMENU _create_submenu()
+	{
+		HMENU pop = CreatePopupMenu();
+		if (!pop) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"CreatePopupMenu failed.");
+		}
+		return pop;
+	}
+};
+
+// Manages a horizontal main window menu.
+// Calls CreateMenu() on constructor.
+class menu_main final : public menu {
+public:
+	menu_main() : menu{CreateMenu()}
+	{
+		if (!this->_hMenu) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"CreateMenu failed.");
+		}
+	}
+
+	menu_main(menu_main&& other) noexcept { this->operator=(std::move(other)); } // movable only
+
+	menu_main& operator=(menu_main&& other) noexcept
+	{
+		DestroyMenu(this->_hMenu);
+		this->_hMenu = nullptr;
+		std::swap(this->_hMenu, other._hMenu);
+		return *this;
+	}
+};
+
+// Manages a popup menu.
+// Calls CreatePopupMenu() on constructor, DestroyMenu() on destructor.
+class menu_popup final : public menu {
+public:
+	~menu_popup() { this->destroy_menu(); }
+
+	menu_popup() : menu{CreatePopupMenu()}
+	{
+		if (!this->_hMenu) {
+			throw std::system_error(GetLastError(), std::system_category(),
+				"CreatePopupMenu failed.");
+		}
+	}
+
+	menu_popup(menu_popup&& other) noexcept { this->operator=(std::move(other)); } // movable only
+
+	menu_popup& operator=(menu_popup&& other) noexcept
+	{
+		this->destroy_menu();
+		std::swap(this->_hMenu, other._hMenu);
+		return *this;
+	}
+
+	// Calls DestroyMenu().
+	void destroy_menu() noexcept
+	{
 		if (this->_hMenu) {
 			DestroyMenu(this->_hMenu);
 			this->_hMenu = nullptr;
 		}
 	}
+};
 
-	menu& load_from_resource(int resourceId, HINSTANCE hInst = nullptr) {
-		if (!hInst) hInst = GetModuleHandleW(nullptr);
-		this->_hMenu = LoadMenuW(hInst, MAKEINTRESOURCEW(resourceId));
+// Manages a menu loaded from the resource.
+// Calls LoadMenu() on constructor.
+// Loaded resources are automatically destroyed by the system.
+class menu_resource final : public menu {
+public:
+	menu_resource() = default;
+	explicit menu_resource(int menuId) { this->load(menuId); }
+	menu_resource(menu_resource&& other) noexcept { this->operator=(std::move(other)); } // movable only
+
+	menu_resource& operator=(menu_resource&& other) noexcept
+	{
+		this->_hMenu = nullptr;
+		std::swap(this->_hMenu, other._hMenu);
+		return *this;
+	}
+
+	// Calls LoadMenu().
+	menu_resource& load(int menuId)
+	{
+		this->_hMenu = LoadMenuW(GetModuleHandle(nullptr), MAKEINTRESOURCEW(menuId));
 		if (!this->_hMenu) {
 			throw std::system_error(GetLastError(), std::system_category(),
-				"LoadMenu failed when trying to load menu resource");
+				"LoadMenu failed.");
 		}
-		return *this;
-	}
-
-	menu& load_from_resource(int resourceId, HWND hOwner) {
-		return this->load_from_resource(resourceId,
-			reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hOwner, GWLP_HINSTANCE)));
-	}
-
-	menu& load_from_resource_submenu(int resourceId, size_t subMenuIndex, HINSTANCE hInst = nullptr) {
-		this->load_from_resource(resourceId, hInst);
-		this->_hMenu = GetSubMenu(this->_hMenu, static_cast<int>(subMenuIndex));
-		return *this;
-	}
-
-	menu& load_from_resource_submenu(int resourceId, size_t subMenuIndex, HWND hOwner) {
-		return this->load_from_resource_submenu(resourceId, subMenuIndex,
-			reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hOwner, GWLP_HINSTANCE)));
-	}
-
-	menu get_submenu(size_t pos) const noexcept {
-		return menu(GetSubMenu(this->_hMenu, static_cast<int>(pos)));
-	}
-
-	size_t get_item_count() const noexcept {
-		return static_cast<size_t>(GetMenuItemCount(this->_hMenu));
-	}
-
-	WORD get_item_id(size_t pos) const noexcept {
-		return GetMenuItemID(this->_hMenu, static_cast<int>(pos));
-	}
-
-private:
-	std::wstring _get_caption(UINT identif, BOOL byPos) const {
-		wchar_t captionBuf[64]{}; // arbitrary buffer length
-		MENUITEMINFOW mii{};
-		mii.cbSize     = sizeof(mii);
-		mii.cch        = ARRAYSIZE(captionBuf);
-		mii.dwTypeData = captionBuf;
-		mii.fMask      = MIIM_STRING;
-
-		GetMenuItemInfoW(this->_hMenu, identif, byPos, &mii);
-		return captionBuf;
-	}
-
-	menu& _set_caption(UINT identif, const wchar_t* caption, BOOL byPos) noexcept {
-		MENUITEMINFOW mii{};
-		mii.cbSize = sizeof(mii);
-		mii.dwTypeData = const_cast<wchar_t*>(caption);
-		mii.fMask = MIIM_STRING;
-
-		SetMenuItemInfoW(this->_hMenu, identif, byPos, &mii);
-		return *this;
-	}
-
-public:
-	std::wstring get_caption_by_pos(size_t pos) const { return this->_get_caption(static_cast<UINT>(pos), TRUE); }
-	std::wstring get_caption_by_id(WORD cmdId) const  { return this->_get_caption(cmdId, FALSE); }
-	menu&        set_caption_by_pos(size_t pos, const wchar_t* caption) noexcept      { return this->_set_caption(static_cast<UINT>(pos), caption, TRUE); }
-	menu&        set_caption_by_pos(size_t pos, const std::wstring& caption) noexcept { return this->_set_caption(static_cast<UINT>(pos), caption.c_str(), TRUE); }
-	menu&        set_caption_by_id(WORD cmdId, const wchar_t* caption) noexcept       { return this->_set_caption(cmdId, caption, FALSE); }
-	menu&        set_caption_by_id(WORD cmdId, const std::wstring& caption) noexcept  { return this->_set_caption(cmdId, caption.c_str(), FALSE); }
-
-	menu& append_separator() noexcept {
-		InsertMenuW(this->_hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
-		return *this;
-	}
-
-	menu& insert_separator_before_id(WORD beforeCmdId) noexcept {
-		InsertMenuW(this->_hMenu, beforeCmdId, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
-		return *this;
-	}
-
-	menu& append_item(WORD cmdId, const wchar_t* caption) noexcept {
-		InsertMenuW(this->_hMenu, -1, MF_BYPOSITION | MF_STRING, cmdId, caption);
-		return *this;
-	}
-
-	menu& append_item(WORD cmdId, const std::wstring& caption) noexcept {
-		return this->append_item(cmdId, caption.c_str());
-	}
-
-	menu& insert_item_before_id(WORD newCmdId, WORD beforeCmdId, const wchar_t* caption) noexcept {
-		InsertMenuW(this->_hMenu, beforeCmdId, MF_BYCOMMAND | MF_STRING, newCmdId, caption);
-		return *this;
-	}
-
-	menu& insert_item_before_id(WORD newCmdId, WORD beforeCmdId, const std::wstring& caption) noexcept {
-		return this->insert_item_before_id(newCmdId, beforeCmdId, caption.c_str());
-	}
-
-	menu& enable_item_by_pos(size_t pos, bool doEnable) noexcept {
-		EnableMenuItem(this->_hMenu, static_cast<UINT>(pos),
-			MF_BYPOSITION | ((doEnable) ? MF_ENABLED : MF_GRAYED));
-		return *this;
-	}
-
-	menu& enable_item_by_pos(std::initializer_list<size_t> poss, bool doEnable) noexcept {
-		for (size_t p : poss) {
-			this->enable_item_by_pos(p, doEnable);
-		}
-		return *this;
-	}
-
-	menu& enable_item_by_id(WORD cmdId, bool doEnable) noexcept {
-		EnableMenuItem(this->_hMenu, cmdId,
-			MF_BYCOMMAND | ((doEnable) ? MF_ENABLED : MF_GRAYED));
-		return *this;
-	}
-
-	menu& enable_item_by_id(std::initializer_list<WORD> cmdIds, bool doEnable) noexcept {
-		for (WORD cmdId : cmdIds) {
-			this->enable_item_by_id(cmdId, doEnable);
-		}
-		return *this;
-	}
-
-	menu& set_default_item_by_pos(size_t pos) noexcept {
-		SetMenuDefaultItem(this->_hMenu, static_cast<UINT>(pos), MF_BYPOSITION);
-		return *this;
-	}
-
-	menu& set_default_item_by_id(WORD cmdId) noexcept {
-		SetMenuDefaultItem(this->_hMenu, cmdId, MF_BYCOMMAND);
-		return *this;
-	}
-
-	menu& set_item_check_by_pos(size_t pos, bool doCheck) noexcept {
-		CheckMenuItem(this->_hMenu, static_cast<UINT>(pos),
-			MF_BYPOSITION | (doCheck ? MF_CHECKED : MF_UNCHECKED));
-		return *this;
-	}
-
-	menu& set_item_check_by_id(WORD cmdId, bool doCheck) noexcept {
-		CheckMenuItem(this->_hMenu, cmdId,
-			MF_BYCOMMAND | (doCheck ? MF_CHECKED : MF_UNCHECKED));
-		return *this;
-	}
-
-	menu& set_item_radio_by_pos(size_t firstPosInList, size_t numItemsInList, size_t checkedPos) noexcept {
-		CheckMenuRadioItem(this->_hMenu, static_cast<UINT>(firstPosInList),
-			static_cast<UINT>(firstPosInList + numItemsInList),
-			static_cast<UINT>(checkedPos), MF_BYPOSITION);
-		return *this;
-	}
-
-	menu& set_item_radio_by_id(WORD firstCmdIdInList, size_t numItemsInList, WORD checkedCmdId) noexcept {
-		CheckMenuRadioItem(this->_hMenu, firstCmdIdInList,
-			static_cast<UINT>(firstCmdIdInList + numItemsInList),
-			checkedCmdId, MF_BYCOMMAND);
-		return *this;
-	}
-
-	menu& delete_item_by_pos(size_t pos) noexcept {
-		DeleteMenu(this->_hMenu, static_cast<UINT>(pos), MF_BYPOSITION);
-		return *this;
-	}
-
-	menu& delete_item_by_id(WORD cmdId) noexcept {
-		DeleteMenu(this->_hMenu, cmdId, MF_BYCOMMAND);
-		return *this;
-	}
-
-	menu& delete_all_items() noexcept {
-		for (size_t i = this->get_item_count(); i-- > 0; ) {
-			this->delete_item_by_pos(i);
-		}
-		return *this;
-	}
-
-	menu append_submenu(const wchar_t* caption) const noexcept {
-		menu sub;
-		sub._hMenu = CreatePopupMenu();
-		AppendMenuW(this->_hMenu, MF_STRING | MF_POPUP,
-			reinterpret_cast<UINT_PTR>(sub._hMenu), caption);
-		return sub; // return new submenu, so it can be edited
-	}
-
-	menu append_submenu(const std::wstring& caption) const noexcept {
-		return this->append_submenu(caption.c_str());
-	}
-
-	menu insert_submenu_before_id(WORD beforeCmdId, const wchar_t* caption) const noexcept {
-		menu sub;
-		sub._hMenu = CreatePopupMenu();
-		InsertMenuW(this->_hMenu, beforeCmdId, MF_POPUP | MF_BYCOMMAND,
-			reinterpret_cast<UINT_PTR>(sub._hMenu), caption);
-		return sub; // return new submenu, so it can be edited
-	}
-
-	menu insert_submenu_before_id(WORD beforeCmdId, const std::wstring& caption) const noexcept {
-		return this->insert_submenu_before_id(beforeCmdId, caption.c_str());
-	}
-
-	menu& show_at_point(HWND hParent, POINT pt, HWND hWndCoordsRelativeTo) noexcept {
-		// Shows a popup context menu, anchored at the given coordinates.
-		// The passed coordinates can be relative to any window.
-		POINT ptParent = pt; // receives coordinates relative to hParent
-		ClientToScreen(hWndCoordsRelativeTo ? hWndCoordsRelativeTo : hParent, &ptParent); // to screen coordinates
-		SetForegroundWindow(hParent);
-		TrackPopupMenu(this->_hMenu, 0, ptParent.x, ptParent.y, 0, hParent, nullptr); // owned by dialog, so messages go to it
-		PostMessageW(hParent, WM_NULL, 0, 0); // http://msdn.microsoft.com/en-us/library/ms648002%28VS.85%29.aspx
 		return *this;
 	}
 };
